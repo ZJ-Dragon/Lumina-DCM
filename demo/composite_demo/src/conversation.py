@@ -1,3 +1,20 @@
+# ==============================================================
+# conversation.py — Streamlit front‑end helpers for GLM‑4 chat
+#
+# This module:
+#   • Builds the **system prompt** that is sent to the back‑end LLM
+#     (see `build_system_prompt`).
+#   • Provides the `Conversation` dataclass which wraps a single
+#     chat message (role, content, optional image) and offers
+#     helpers for pretty‑printing inside a Streamlit app.
+#   • Implements utility helpers for quoting browser sources and
+#     post‑processing model output for display (`postprocess_text`).
+#
+# Most functions here are UI glue; no model inference happens in
+# this file.
+# ==============================================================
+
+
 import json
 import re
 from dataclasses import dataclass
@@ -10,8 +27,13 @@ from streamlit.delta_generator import DeltaGenerator
 from tools.browser import Quote, quotes
 
 
+# Regex that matches citation placeholders in the form
+#   【<id>†<raw_text>】
+# These come from the `simple_browser` tool and will later be
+# replaced with proper hyperlinks when rendering to the user.
 QUOTE_REGEX = re.compile(r"【(\d+)†(.+?)】")
 
+# ---------------------- Prompt Templates ----------------------
 SELFCOG_PROMPT = "你是一个名为 GLM-4 的人工智能助手。你是基于智谱AI训练的语言模型 GLM-4 模型开发的，你的任务是针对用户的问题和要求提供适当的答复和支持。"
 DATE_PROMPT = "当前日期: %Y-%m-%d"
 TOOL_SYSTEM_PROMPTS = {
@@ -27,6 +49,25 @@ def build_system_prompt(
     enabled_tools: list[str],
     functions: list[dict],
 ):
+    """
+    Construct the **<|system|>** prompt that instructs GLM‑4 how to
+    behave.
+
+    Parameters
+    ----------
+    enabled_tools : list[str]
+        Tools (e.g. "python", "simple_browser") currently allowed in
+        this session.  A markdown block for each tool is appended.
+    functions : list[dict]
+        Arbitrary function specs passed from back‑end; they are
+        pretty‑printed as JSON for the user to read.
+
+    Returns
+    -------
+    str
+        Full prompt string including date, tool docs, and function
+        specs.
+    """
     value = SELFCOG_PROMPT
     value += "\n\n" + datetime.now().strftime(DATE_PROMPT)
     if enabled_tools or functions:
@@ -43,14 +84,17 @@ def build_system_prompt(
 
 
 def response_to_str(response: str | dict[str, str]) -> str:
-    """
-    Convert response to string.
-    """
+    """Normalize assistant/tool response to plain string."""
     if isinstance(response, dict):
         return response.get("name", "") + response.get("content", "")
     return response
 
 
+# ----------------------- Chat Roles ---------------------------
+# Enum maps internal role to the special GLM‑4 tokens so we can
+# build prompts like:
+#   <|user|> 你好
+#   <|assistant|> 你好！
 class Role(Enum):
     SYSTEM = auto()
     USER = auto()
@@ -59,6 +103,7 @@ class Role(Enum):
     OBSERVATION = auto()
 
     def __str__(self):
+        # Map enum value to special chat token expected by GLM‑4
         match self:
             case Role.SYSTEM:
                 return "<|system|>"
@@ -91,6 +136,23 @@ class Role(Enum):
 
 @dataclass
 class Conversation:
+    """
+    A single message (user / assistant / tool / observation) plus
+    helpers to render it inside Streamlit.
+
+    Attributes
+    ----------
+    role : Role
+        Who sent the message.
+    content : str | dict
+        Raw content (plain text or tool kwargs).
+    saved_content : str | None
+        Post‑processed markdown; used for caching.
+    metadata : str | None
+        Extra info (e.g. tool name or source id).
+    image : str | PIL.Image | None
+        Optional image to show with this message.
+    """
     role: Role
     content: str | dict
     # Processed content
@@ -143,6 +205,25 @@ class Conversation:
 
 
 def postprocess_text(text: str, replace_quote: bool) -> str:
+    """
+    Clean up model output before displaying:
+      1. Remove escaped LaTeX brackets inserted by frontend.
+      2. Strip special GLM‑4 role tokens.
+      3. Optionally replace citation placeholders with hyperlinks.
+
+    Parameters
+    ----------
+    text : str
+        Raw text from model/tool.
+    replace_quote : bool
+        If True, convert placeholder 【id†text】 into markdown links.
+
+    Returns
+    -------
+    str
+        Sanitized markdown ready for Streamlit.
+    """
+    # --- Un‑escape brackets used for mathjax ---
     text = text.replace(r"\(", "$")
     text = text.replace(r"\)", "$")
     text = text.replace(r"\[", "$$")
@@ -155,6 +236,7 @@ def postprocess_text(text: str, replace_quote: bool) -> str:
 
     # Replace quotes
     if replace_quote:
+        # --- Swap citation placeholders with actual links ---
         for match in QUOTE_REGEX.finditer(text):
             quote_id = match.group(1)
             quote = quotes.get(quote_id, Quote("未找到引用内容", ""))
